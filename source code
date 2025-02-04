@@ -1,0 +1,236 @@
+#!/bin/bash
+# Instagram Reel Downloader Script
+# Requires: yt-dlp (auto-installs or uses custom path)
+# Instagram Reel Downloader Script for Kali Linux WSL
+# Requires: yt-dlp (will auto-install), awk, grep, coreutils
+# Features: Configurable download location, quality optimization, and command controls
+
+CONFIG_FILE="$HOME/.instagram_downloader.conf"
+TMP_ERR_FILE="$(mktemp)"
+
+cleanup() {
+    rm -f "$TMP_ERR_FILE"
+}
+trap cleanup EXIT
+
+show_help() {
+    echo "Instagram Reel Downloader Help:"
+    echo "  ./$(basename "$0") [URL]         - Download a reel"
+    echo "  ./$(basename "$0") help          - Show this help"
+    echo "  ./$(basename "$0") change_location - Change download directory"
+    echo "  ./$(basename "$0") set_ytdlp_path - Set custom path to yt-dlp"
+}
+
+create_directory() {
+    local dir_path="$1"
+    if [ ! -d "$dir_path" ]; then
+        echo "Creating directory: $dir_path" >&2
+        mkdir -p "$dir_path" || {
+            echo "FATAL ERROR: Failed to create directory '$dir_path'" >&2
+            exit 1
+        }
+    fi
+}
+
+validate_config() {
+    local config_file="$1"
+    local valid_regex='^(#.*|[[:space:]]*|(DOWNLOAD_DIR|YT_DLP_PATH)="[^"]*")$'
+    
+    [ ! -f "$config_file" ] && return 0
+    
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ ! "$line" =~ $valid_regex ]]; then
+            echo "Error: Invalid config line: '$line'" >&2
+            return 1
+        fi
+    done < "$config_file"
+}
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        if validate_config "$CONFIG_FILE"; then
+            if ! source "$CONFIG_FILE" 2> "$TMP_ERR_FILE"; then
+                echo "Error: Failed to load config file (syntax error)" >&2
+                echo "Backup created: ${CONFIG_FILE}.corrupted" >&2
+                mv "$CONFIG_FILE" "${CONFIG_FILE}.corrupted"
+                return 1
+            fi
+        else
+            echo "Error: Invalid config entries" >&2
+            mv "$CONFIG_FILE" "${CONFIG_FILE}.corrupted"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+update_config_var() {
+    local var_name="$1"
+    local var_value="$2"
+    
+    [ ! -f "$CONFIG_FILE" ] && touch "$CONFIG_FILE"
+    sed -i "/^${var_name}=/d" "$CONFIG_FILE"
+    echo "${var_name}=\"${var_value}\"" >> "$CONFIG_FILE"
+}
+
+check_internet() {
+    echo "Checking internet connectivity..." >&2
+    if ! curl --max-time 10 --silent --head https://www.google.com >/dev/null 2>&1 && \
+       ! curl --max-time 10 --silent --head https://github.com >/dev/null 2>&1; then
+        echo "Error: No internet connection or DNS failure." >&2
+        echo "       Required for yt-dlp installation." >&2
+        exit 1
+    fi
+}
+
+check_sudo_privileges() {
+    echo "Checking for sudo privileges..." >&2
+    if ! sudo -v 2>/dev/null; then
+        echo "Error: Sudo privileges required but not available." >&2
+        echo "       Please either:" >&2
+        echo "       1. Run this script with sudo." >&2
+        echo "       2. Install yt-dlp manually to a custom location." >&2
+        echo "       3. Use './$(basename "$0") set_ytdlp_path' to specify an existing yt-dlp." >&2
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    if ! load_config; then
+        echo "Using default settings" >&2
+        DOWNLOAD_DIR="$HOME/Downloads/InstagramReels"
+        YT_DLP_PATH=""
+    fi
+
+    if [ -n "$YT_DLP_PATH" ]; then
+        if [ ! -f "$YT_DLP_PATH" ] || [ ! -x "$YT_DLP_PATH" ]; then
+            echo "Error: Configured YT_DLP_PATH '$YT_DLP_PATH' is invalid." >&2
+            echo "Run './$(basename "$0") set_ytdlp_path' to fix." >&2
+            exit 1
+        fi
+        if ! "$YT_DLP_PATH" --version &>/dev/null; then
+            echo "Error: '$YT_DLP_PATH' is not a valid yt-dlp executable." >&2
+            exit 1
+        fi
+        YT_DLP_CMD="$YT_DLP_PATH"
+        echo "Using yt-dlp from custom path: $YT_DLP_PATH" >&2
+    elif command -v yt-dlp &>/dev/null; then
+        YT_DLP_CMD="yt-dlp"
+        echo "Using system-wide yt-dlp." >&2
+    else
+        check_internet
+        check_sudo_privileges
+        echo "Installing yt-dlp..." >&2
+        sudo apt-get update && sudo apt-get install -y yt-dlp
+        if command -v yt-dlp &>/dev/null; then
+            YT_DLP_CMD="yt-dlp"
+        else
+            echo "Error: Automatic installation failed. Either:" >&2
+            echo "  1. Install manually: curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp && chmod +x ~/.local/bin/yt-dlp" >&2
+            echo "  2. Use a custom path: ./$(basename "$0") set_ytdlp_path" >&2
+            exit 1
+        fi
+    fi
+}
+download_reel() {
+    local url="$1"
+    local download_dir="$2"
+
+    # Ensure YT_DLP_CMD is defined and executable
+    if [[ -z "$YT_DLP_CMD" ]]; then
+        echo "Error: YT_DLP_CMD is not defined. Please configure yt-dlp path first." >&2
+        return 1
+    fi
+
+    if ! command -v "$YT_DLP_CMD" >/dev/null 2>&1; then
+        echo "Error: '$YT_DLP_CMD' not found or not executable. Verify installation." >&2
+        return 1
+    fi
+
+    # Validate URL format
+    if [[ ! "$url" =~ ^https?://(www\.)?instagram\.com/(reel|reels)/ ]]; then
+        echo "Error: Invalid URL. Must be an Instagram Reel (start with https://www.instagram.com/reel/...)" >&2
+        return 1
+    fi
+
+    echo "Starting download..." >&2
+
+    # Critical fix: Quote output path to handle spaces
+    "$YT_DLP_CMD" -N 4 --quiet -k \
+        -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+        -o "${download_dir}/%(upload_date>%Y%m%d)s_%(id)s.%(ext)s" \
+        --merge-output-format mp4 "$url"
+
+    # Handle download result
+    if [ $? -eq 0 ]; then
+        echo "Download complete! Files saved to: '$download_dir'" >&2
+    else
+        echo "Download failed. Possible reasons:" >&2
+        echo "1. Private/age-restricted content" >&2
+        echo "2. Network connectivity issues" >&2
+        echo "3. Invalid permissions for download directory" >&2
+        return 1
+    fi
+}
+
+main() {
+    check_dependencies
+
+    DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads/InstagramReels}"
+    create_directory "$DOWNLOAD_DIR"
+
+    case "$1" in
+        "change_location")
+            read -p "Enter new download directory (full path): " new_dir
+            new_dir="${new_dir/#\~/$HOME}"
+            create_directory "$new_dir"
+            update_config_var "DOWNLOAD_DIR" "$new_dir"
+            echo "Location updated to: $new_dir" >&2
+            exit 0
+            ;;
+        "set_ytdlp_path")
+            read -p "Enter full path to yt-dlp executable: " yt_dlp_path
+            yt_dlp_path="${yt_dlp_path/#\~/$HOME}"
+            if [ -z "$yt_dlp_path" ]; then
+                echo "Error: Path cannot be empty." >&2
+                exit 1
+            fi
+            if [ ! -f "$yt_dlp_path" ]; then
+                echo "Error: Path '$yt_dlp_path' does not exist or is not a file." >&2
+                exit 1
+            fi
+            if [ ! -x "$yt_dlp_path" ]; then
+                echo "Error: '$yt_dlp_path' is not executable." >&2
+                exit 1
+            fi
+            if ! "$yt_dlp_path" --version &>/dev/null; then
+                echo "Error: '$yt_dlp_path' is not a valid yt-dlp executable." >&2
+                exit 1
+            fi
+            update_config_var "YT_DLP_PATH" "$yt_dlp_path"
+            echo "Custom yt-dlp path validated and set: $yt_dlp_path" >&2
+            exit 0
+            ;;
+        "help")
+            show_help
+            exit 0
+            ;;
+        *)
+            local url
+            if [ -z "$1" ]; then
+                read -p "Enter Instagram Reel URL: " url
+            else
+                url="$1"
+            fi
+            download_reel "$url" "$DOWNLOAD_DIR"
+            ;;
+    esac
+}
+
+if [ "$#" -gt 1 ]; then
+    echo "Error: Too many arguments" >&2
+    show_help
+    exit 1
+fi
+
+main "$@"
