@@ -1,0 +1,726 @@
+#!/usr/bin/env bash
+#
+# extract_audio_v2.19
+# YouTube Audio Extractor — Smart Manager v2.19
+# CRITICAL FIXES: Logical errors, find syntax, md5sum dependency, newline handling
+#
+set -euo pipefail
+IFS=$'\n\t'
+# ---------------------------
+# Colors & symbols (UI)
+# ---------------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+CHECK="✅"; CROSS="❌"; WARN="⚠️"; INFO="ℹ️"; DOWNLOAD="📥"
+MUSIC="🎵"; FOLDER="📁"; LIVE="🔴"; LINK="🔗"
+# ---------------------------
+# Configuration (can override via ENV)
+# ---------------------------
+DEST_DIR="${AUDIO_DOWNLOAD_DIR:-/mnt/f/Music}"
+LOG_FILE="${LOG_FILE:-/tmp/extract_audio_v2.19.log}"
+QUEUE_DIR="${QUEUE_DIR:-/tmp/yt_queue_v2.19}"
+LOCK_FILE="${LOCK_FILE:-/tmp/extract_audio_v2.19.lock}"
+MAX_RETRIES="${MAX_RETRIES:-3}"
+FILE_SIZE_THRESHOLD="${FILE_SIZE_THRESHOLD:-10000}"   # bytes
+MAX_RENAME_ATTEMPTS="${MAX_RENAME_ATTEMPTS:-100}"     # prevent infinite loops
+# dynamic parallelism default
+DEFAULT_PARALLEL=$(( ( $(nproc 2>/dev/null || echo 2) / 2 ) ))
+(( DEFAULT_PARALLEL < 1 )) && DEFAULT_PARALLEL=1
+# initialize from env or default; sanitize below
+MAX_PARALLEL="${CONCURRENT_DOWNLOADS:-$DEFAULT_PARALLEL}"
+# Comprehensive audio extensions including all yt-dlp possibilities
+AUDIO_EXTS=('mp3' 'm4a' 'webm' 'opus' 'aac' 'flac' 'ogg' 'mka' 'alac' 'wav' 'wma')
+# ensure dirs & log exist
+mkdir -p "$DEST_DIR" "$QUEUE_DIR"
+touch "$LOG_FILE" || { printf '%b%s%b\n' "$RED" " ${CROSS} Cannot write to log $LOG_FILE" "$NC"; exit 1; }
+# Validate lock file directory is writable
+LOCK_DIR="$(dirname "$LOCK_FILE")"
+if [ ! -w "$LOCK_DIR" ]; then
+  printf '%b%s%b\n' "$RED" " ${CROSS} Lock directory $LOCK_DIR is not writable" "$NC"
+  exit 1
+fi
+# ---------------------------
+# Concurrency-safe logging & pretty print
+# ---------------------------
+log_safe() {
+  local msg="${1:-}"; local lvl="${2:-INFO}"
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+  { flock -x 9
+    printf '%s [%s] %s\n' "$ts" "$lvl" "$msg" >> "$LOG_FILE"
+  } 9>"$LOCK_FILE"
+}
+pretty_print() {
+  local color="${1:-}"; local msg="${2:-}"
+  { flock -x 9
+    printf '%b%s%b\n' "$color" "$msg" "$NC"
+  } 9>"$LOCK_FILE"
+}
+# ---------------------------
+# Header (purple + cyan mix)
+# ---------------------------
+print_header() {
+  printf '\n'
+  pretty_print "$PURPLE" "╔════════════════════════════════════════════╗"
+  pretty_print "$PURPLE" "║           ${MUSIC} YouTube Audio Extractor       ║"
+  pretty_print "$CYAN"   "║           Smart Manager v2.19             ║"
+  pretty_print "$GREEN"  "║         Logical Errors Fixed             ║"
+  pretty_print "$PURPLE" "╚════════════════════════════════════════════╝"
+  printf '\n'
+}
+# ---------------------------
+# Cleanup & traps
+# ---------------------------
+cleanup_and_exit() {
+  local code="${1:-0}"
+  jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
+  wait 2>/dev/null || true
+  # Cleanup any remaining marker files
+  find /tmp -maxdepth 1 -name "extract_marker_*" -mtime +1 -delete 2>/dev/null || true
+  log_safe "Exiting with code $code" "INFO"
+  exit "$code"
+}
+trap 'cleanup_and_exit 130' INT
+trap 'cleanup_and_exit 143' TERM
+trap 'cleanup_and_exit 0' EXIT
+# ---------------------------
+# Pre-flight checks
+# ---------------------------
+if [ ! -d "$DEST_DIR" ]; then
+  pretty_print "$RED" "${CROSS} Destination directory $DEST_DIR does not exist. Please create it."
+  exit 1
+fi
+if [ ! -w "$DEST_DIR" ]; then
+  pretty_print "$RED" "${CROSS} No write permission for $DEST_DIR. Check mount/permissions."
+  exit 1
+fi
+# Check for required tools
+if ! command -v yt-dlp >/dev/null 2>&1 && ! command -v youtube-dl >/dev/null 2>&1; then
+  pretty_print "$RED" "${CROSS} Neither yt-dlp nor youtube-dl found. Please install at least one."
+  exit 1
+fi
+# FIX 2: Check for md5sum availability
+if ! command -v md5sum >/dev/null 2>&1; then
+  pretty_print "$RED" "${CROSS} md5sum not found. Required for marker creation."
+  exit 1
+fi
+# sanitize MAX_PARALLEL (numeric, >=1, <= nproc*2)
+sanitize_parallel() {
+  local v="$1"
+  if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+    v="$DEFAULT_PARALLEL"
+  fi
+  (( v < 1 )) && v=1
+  local max_allowed=$(( (nproc 2>/dev/null || echo 2) * 2 ))
+  (( v > max_allowed )) && v="$max_allowed"
+  printf '%s' "$v"
+}
+MAX_PARALLEL=$(sanitize_parallel "$MAX_PARALLEL")
+# ---------------------------
+# FIX 3: Enhanced sanitization with newline handling
+# ---------------------------
+sanitize_filename() {
+  local input="$1"
+  # Remove/replace invalid filesystem characters including newlines
+  local sanitized
+  sanitized=$(printf '%s' "$input" | tr '\n' '_' | sed 's#[<>:"/\\|?*]#_#g')
+  # Remove leading/trailing whitespace
+  sanitized=$(printf '%s' "$sanitized" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  # Collapse multiple spaces/underscores
+  sanitized=$(printf '%s' "$sanitized" | tr -s ' ' | tr -s '_')
+  # Remove leading dots (hidden files)
+  sanitized=$(printf '%s' "$sanitized" | sed 's/^\.*//')
+  # Truncate to safe length (200 chars)
+  sanitized=$(printf '%s' "$sanitized" | cut -c1-200)
+  # Ensure non-empty result
+  [ -z "$sanitized" ] && sanitized="audio_$(date +%s)"
+  printf '%s' "$sanitized"
+}
+# ---------------------------
+# FIX 5: URL Validation with port support
+# ---------------------------
+validate_youtube_url() {
+  local url="$1"
+  local url_lower
+  url_lower=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
+  
+  # Updated regex to allow optional ports
+  if [[ "$url_lower" =~ ^https?://(www\.)?(youtube\.com|youtu\.be)(:[0-9]+)?/ ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+# ---------------------------
+# Helpers: title, duration, filesize
+# ---------------------------
+get_video_title() {
+  local url="$1"; local title=""
+  if command -v yt-dlp >/dev/null 2>&1; then
+    title=$(yt-dlp --skip-download --print "%(title)s" "$url" 2>/dev/null | head -n1 || true)
+  fi
+  if [ -z "$title" ] && command -v youtube-dl >/dev/null 2>&1; then
+    title=$(youtube-dl --get-title "$url" 2>/dev/null | head -n1 || true)
+  fi
+  if [ -z "$title" ]; then title="Untitled_$(date +%s)"; fi
+  printf '%s' "$title"
+}
+get_video_duration() {
+  local url="$1"; local d=""
+  if command -v yt-dlp >/dev/null 2>&1; then
+    d=$(yt-dlp --skip-download --print "%(duration)s" "$url" 2>/dev/null | head -n1 || true)
+  elif command -v youtube-dl >/dev/null 2>&1; then
+    # Fallback to youtube-dl for duration
+    d=$(youtube-dl --skip-download --get-duration "$url" 2>/dev/null | head -n1 || true)
+    # youtube-dl returns format like "3:45", convert to seconds
+    if [[ "$d" =~ ^[0-9]+:[0-9]+$ ]]; then
+      local mins="${d%%:*}"
+      local secs="${d##*:}"
+      d=$(( mins * 60 + secs ))
+    elif [[ "$d" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]; then
+      # Handle HH:MM:SS format
+      local hrs="${d%%:*}"
+      local rest="${d#*:}"
+      local mins="${rest%%:*}"
+      local secs="${rest##*:}"
+      d=$(( hrs * 3600 + mins * 60 + secs ))
+    fi
+  fi
+  [[ "$d" =~ ^[0-9]+$ ]] || d=0
+  printf '%s' "$d"
+}
+get_filesize_approx() {
+  local url="$1"; local s=""
+  if command -v yt-dlp >/dev/null 2>&1; then
+    s=$(yt-dlp --skip-download --print "%(filesize_approx)s" "$url" 2>/dev/null | head -n1 || true)
+  elif command -v youtube-dl >/dev/null 2>&1; then
+    # Fallback to youtube-dl for filesize
+    s=$(youtube-dl --skip-download --get-filesize "$url" 2>/dev/null | head -n1 || true)
+  fi
+  [[ "$s" =~ ^[0-9]+$ ]] || s=0
+  printf '%s' "$s"
+}
+compute_weight() {
+  local url="$1"
+  local fs; fs=$(get_filesize_approx "$url")
+  if (( fs > 0 )); then printf '%s' "$fs"; return; fi
+  local dur; dur=$(get_video_duration "$url")
+  printf '%s' $(( dur * 1000 ))
+}
+# FIXED: URL-based marker creation to prevent race conditions
+create_marker_for_url() {
+  local url="$1"
+  # Create unique hash from URL to prevent conflicts
+  local url_hash
+  url_hash=$(printf '%s' "$url" | md5sum | cut -d' ' -f1)
+  local marker
+  marker=$(mktemp -t "extract_marker_${url_hash}_XXXXXX" 2>>"$LOG_FILE") || { 
+    log_safe "mktemp failed for URL $url" "ERROR"
+    return 1
+  }
+  # Small delay to ensure marker timestamp is stable
+  sleep 0.1
+  printf '%s' "$marker"
+}
+# FIX 1: Corrected find command syntax with proper grouping
+find_new_audio_file_for_title() {
+  local marker="$1"; local sanitized_title="$2"
+  local found=""
+  
+  # Build efficient find command with proper parentheses grouping
+  local find_cmd="find \"$DEST_DIR\" -maxdepth 1 -type f \("
+  
+  # Add all audio extensions with proper OR grouping
+  local first_ext=true
+  for ext in "${AUDIO_EXTS[@]}"; do
+    if $first_ext; then
+      find_cmd="$find_cmd -iname \"*.${ext}\""
+      first_ext=false
+    else
+      find_cmd="$find_cmd -o -iname \"*.${ext}\""
+    fi
+  done
+  find_cmd="$find_cmd \)"
+  
+  # Primary: Time-based detection (any audio file newer than marker)
+  found=$(eval "$find_cmd -newer \"$marker\" 2>/dev/null" | head -n1)
+  if [ -n "$found" ]; then 
+    printf '%s' "$found"
+    return
+  fi
+  
+  # Fallback: Title substring match with sanitized title
+  local safe_title_sub=$(printf '%s' "$sanitized_title" | sed 's/[^[:alnum:]]/_/g' | cut -c1-30)
+  found=$(eval "$find_cmd | grep -i \"$safe_title_sub\" 2>/dev/null" | head -n1)
+  if [ -n "$found" ]; then 
+    printf '%s' "$found"
+    return
+  fi
+  
+  # Final attempt: Exact sanitized title match
+  for ext in "${AUDIO_EXTS[@]}"; do
+    local candidate="${DEST_DIR}/${sanitized_title}.${ext}"
+    if [ -f "$candidate" ] && [ -s "$candidate" ]; then
+      printf '%s' "$candidate"
+      return
+    fi
+  done
+  
+  printf ''  # nothing found
+}
+# file size portable
+file_size() {
+  local f="$1"
+  stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0
+}
+# FIXED: Proper file extension extraction
+get_file_extension() {
+  local filepath="$1"
+  local base; base=$(basename "$filepath")
+  # Handle files with multiple dots correctly
+  if [[ "$base" =~ \.[^.]+\.[^.]+$ ]]; then
+    # Multiple extensions, take the last one
+    printf '%s' "${base##*.}"
+  elif [[ "$base" =~ \.[^.]+$ ]]; then
+    # Single extension
+    printf '%s' "${base##*.}"
+  else
+    # No extension
+    printf ''
+  fi
+}
+# FIX 4: Enhanced uniqueness with proper extension handling (no trailing dot)
+make_unique_if_needed() {
+  local filepath="$1"
+  local dir="$DEST_DIR"
+  
+  # Extract actual extension from the downloaded file
+  local actual_ext
+  actual_ext=$(get_file_extension "$filepath")
+  
+  # Extract sanitized title (everything before the extension)
+  local base_filename
+  base_filename=$(basename "$filepath")
+  local sanitized_title="${base_filename%.$actual_ext}"
+  
+  # FIX 4: Conditionally build target_name to avoid trailing dots
+  local target_name
+  if [ -n "$actual_ext" ]; then
+    target_name="${sanitized_title}.${actual_ext}"
+  else
+    target_name="$sanitized_title"
+  fi
+  
+  local attempt=0
+  
+  # Check if target location already has a file
+  while [ -e "$dir/$target_name" ] && (( attempt < MAX_RENAME_ATTEMPTS )); do
+    
+    # If existing entry is a directory (not a file), force rename
+    if [ ! -f "$dir/$target_name" ]; then
+      log_safe "Directory conflict: $target_name exists as directory, forcing rename" "WARN"
+      ((attempt++))
+      if [ -n "$actual_ext" ]; then
+        target_name="${sanitized_title}_${attempt}.${actual_ext}"
+      else
+        target_name="${sanitized_title}_${attempt}"
+      fi
+      continue
+    fi
+    
+    # Compare downloaded file with existing file
+    if cmp -s "$filepath" "$dir/$target_name" 2>>"$LOG_FILE"; then
+      # Identical content - remove the new download (duplicate)
+      log_safe "Duplicate detected: $(basename "$filepath") matches existing $target_name" "INFO"
+      rm -f "$filepath" 2>>"$LOG_FILE" || true
+      printf '%s' "$target_name"
+      return 0
+    fi
+    
+    # Different content - need unique name
+    ((attempt++))
+    if [ -n "$actual_ext" ]; then
+      target_name="${sanitized_title}_${attempt}.${actual_ext}"
+    else
+      target_name="${sanitized_title}_${attempt}"
+    fi
+  done
+  
+  # Check if we hit max attempts
+  if (( attempt >= MAX_RENAME_ATTEMPTS )); then
+    log_safe "Max rename attempts ($MAX_RENAME_ATTEMPTS) reached for $(basename "$filepath")" "ERROR"
+    # Return original name as fallback
+    printf '%s' "$(basename "$filepath")"
+    return 1
+  fi
+  
+  # If filepath is already in DEST_DIR with the target name, we're done
+  if [ "$filepath" = "$dir/$target_name" ]; then
+    printf '%s' "$target_name"
+    return 0
+  fi
+  
+  # Move/rename the file to its target location
+  if mv -f "$filepath" "$dir/$target_name" 2>>"$LOG_FILE"; then
+    log_safe "Renamed: $(basename "$filepath") → $target_name" "INFO"
+    printf '%s' "$target_name"
+    return 0
+  else
+    log_safe "Failed to rename $(basename "$filepath") to $target_name" "ERROR"
+    printf '%s' "$(basename "$filepath")"
+    return 1
+  fi
+}
+# FIXED: Check for existing valid files (any extension)
+find_existing_audio_file_for_title() {
+  local sanitized_title="$1"
+  local found=""
+  
+  # Check for existing files with sanitized title (any audio extension)
+  for ext in "${AUDIO_EXTS[@]}"; do
+    local candidate="${DEST_DIR}/${sanitized_title}.${ext}"
+    if [ -e "$candidate" ] && [ -f "$candidate" ]; then  # Ensure it's a file, not a directory
+      found="$candidate"
+      break
+    fi
+  done
+  
+  printf '%s' "$found"
+}
+# ---------------------------
+# FIXED: Download worker with URL-based markers
+# ---------------------------
+download_worker() {
+  local url="$1"
+  
+  # Redirect stderr to LOG_FILE for complete error logging
+  exec 2>>"$LOG_FILE"
+  
+  # Get raw title and sanitize it ONCE for consistent use
+  local raw_title; raw_title=$(get_video_title "$url" 2>/dev/null || true)
+  [ -z "$raw_title" ] && raw_title="Untitled_$(date +%s)"
+  local sanitized_title; sanitized_title=$(sanitize_filename "$raw_title")
+
+  # Strip any trailing audio extension from sanitized_title to avoid double extensions
+  local original_sanitized_title="$sanitized_title"
+  if [[ "$original_sanitized_title" == *.* ]]; then
+    local base_name="${original_sanitized_title%.*}"
+    local title_ext="${original_sanitized_title##*.}"
+    local is_audio_ext=false
+    for ext in "${AUDIO_EXTS[@]}"; do
+      if [[ "$title_ext" == "$ext" ]]; then
+        is_audio_ext=true
+        break
+      fi
+    done
+    if $is_audio_ext; then
+      sanitized_title="$base_name"
+      log_safe "Stripped trailing audio extension from title: $original_sanitized_title → $sanitized_title" "DEBUG"
+    fi
+  fi
+
+  # FIXED: Create URL-based marker to prevent race conditions
+  local marker
+  marker=$(create_marker_for_url "$url") || {
+    pretty_print "$RED" "${CROSS} [$sanitized_title] Cannot create marker (disk/perm?)"
+    log_safe "MARKER_FAIL $url" "ERROR"
+    printf '%s|%s|%s\n' "$sanitized_title" "$url" "marker_creation_failed" >> "$QUEUE_DIR/failures.txt"
+    return 1
+  }
+  
+  pretty_print "$PURPLE" "╔════════════════════════════════════════════╗"
+  pretty_print "$PURPLE" "║   ${MUSIC} Processing: $(echo "$sanitized_title" | cut -c1-40)..."
+  pretty_print "$PURPLE" "╚════════════════════════════════════════════╝"
+  pretty_print "$CYAN" "${INFO} Starting: $sanitized_title"
+  log_safe "START $sanitized_title | $url" "INFO"
+  
+  local attempt=0 success=0 last_err=""
+  while (( attempt < MAX_RETRIES )); do
+    ((attempt++))
+    
+    # Use sanitized title in output path to prevent invalid filenames
+    # Primary: yt-dlp android client
+    if command -v yt-dlp >/dev/null 2>&1; then
+      if yt-dlp -x --audio-format mp3 --no-overwrites \
+         --extractor-args "youtube:player_client=android" \
+         --no-part \
+         -o "$DEST_DIR/${sanitized_title}.%(ext)s" \
+         "$url" >>"$LOG_FILE" 2>&1; then
+        success=1
+      else
+        last_err="yt-dlp attempt $attempt failed"
+        log_safe "$last_err | $url" "WARN"
+      fi
+    fi
+    # Fallback: youtube-dl if not succeeded
+    if (( success == 0 )) && command -v youtube-dl >/dev/null 2>&1; then
+      if youtube-dl -x --audio-format mp3 --no-overwrites \
+         --no-part \
+         -o "$DEST_DIR/${sanitized_title}.%(ext)s" \
+         "$url" >>"$LOG_FILE" 2>&1; then
+        success=1
+      else
+        last_err="youtube-dl attempt $attempt failed"
+        log_safe "$last_err | $url" "WARN"
+      fi
+    fi
+    # Guard bestaudio fallback with yt-dlp availability check
+    if (( success == 0 )); then
+      if command -v yt-dlp >/dev/null 2>&1; then
+        pretty_print "$YELLOW" "${WARN} [$sanitized_title] Attempt $attempt failed — trying bestaudio fallback"
+        if yt-dlp -x --audio-format bestaudio --no-overwrites \
+           --no-part \
+           -o "$DEST_DIR/${sanitized_title}.%(ext)s" \
+           "$url" >>"$LOG_FILE" 2>&1; then
+          success=1
+        else
+          last_err="bestaudio attempt $attempt failed"
+          log_safe "$last_err | $url" "WARN"
+        fi
+      else
+        # Skip fallback if yt-dlp is unavailable
+        last_err="bestaudio fallback skipped (yt-dlp not installed)"
+        log_safe "$last_err | $url" "WARN"
+        pretty_print "$YELLOW" "${WARN} [$sanitized_title] Attempt $attempt failed — bestaudio fallback skipped (yt-dlp not available)"
+      fi
+    fi
+    
+    # FIXED: Enhanced verification with existing file detection
+    if (( success == 1 )); then
+      # Multi-pass detection with extended window (for NEW files)
+      local found=""
+      for i in {1..5}; do
+        found=$(find_new_audio_file_for_title "$marker" "$sanitized_title")
+        [ -n "$found" ] && break
+        sleep 0.5
+      done
+      # If no new file found, check for existing valid files
+      if [ -z "$found" ]; then
+        found=$(find_existing_audio_file_for_title "$sanitized_title")
+        if [ -n "$found" ]; then
+          log_safe "Existing valid file detected (--no-overwrites skip): $(basename "$found")" "INFO"
+          pretty_print "$CYAN" "${INFO} [$sanitized_title] File already exists: $(basename "$found")"
+        fi
+      fi
+      if [ -n "$found" ] && [ -s "$found" ]; then
+        local sz; sz=$(file_size "$found")
+        if (( sz >= FILE_SIZE_THRESHOLD )); then
+          # Handle uniqueness with the FIXED function
+          local final_name; final_name=$(make_unique_if_needed "$found")
+          pretty_print "$GREEN" "${CHECK} [$sanitized_title] Success: ${final_name} (${sz} bytes)"
+          log_safe "SUCCESS $sanitized_title → ${final_name} (${sz} bytes)" "SUCCESS"
+          printf '%s|%s|%s\n' "$final_name" "$url" "$sz" >> "$QUEUE_DIR/successes.txt"
+          rm -f "$marker" 2>/dev/null || true
+          echo -e "📄 Log file   : $LOG_FILE\n📁 Queue dir  : $QUEUE_DIR\n"
+          return 0
+        else
+          pretty_print "$YELLOW" "${WARN} [$sanitized_title] File too small (${sz} bytes), removing and retrying"
+          log_safe "TOO_SMALL $sanitized_title (${sz} bytes)" "WARN"
+          rm -f "$found" 2>/dev/null || true
+          success=0
+        fi
+      else
+        pretty_print "$YELLOW" "${WARN} [$sanitized_title] Could not verify output after attempt $attempt"
+        log_safe "UNVERIFIED $sanitized_title" "WARN"
+        success=0
+      fi
+    fi
+    sleep 1
+  done
+  # Final fail - cleanup marker
+  rm -f "$marker" 2>/dev/null || true
+  pretty_print "$RED" "${CROSS} [$sanitized_title] Failed after $MAX_RETRIES attempts"
+  log_safe "FAILED $sanitized_title | $url | last_err: $last_err" "ERROR"
+  
+  # Ensure title is always included in failure logs
+  if [ -z "$sanitized_title" ]; then
+    sanitized_title="Unknown_Title_$(date +%s)"
+  fi
+  # Use proper field separation in failure logs
+  printf '%s|%s|%s\n' "$sanitized_title" "$url" "${last_err:-unknown_error}" >> "$QUEUE_DIR/failures.txt"
+  
+  echo -e "📄 Log file   : $LOG_FILE\n📁 Queue dir  : $QUEUE_DIR\n"
+  return 1
+}
+# ---------------------------
+# FIXED: Queue creation with proper array handling
+# ---------------------------
+create_sorted_queue() {
+  local urls=("$@")  # FIXED: Use array copy instead of reference
+  local qfile; qfile=$(mktemp "$QUEUE_DIR/queue.XXXXXX" 2>>"$LOG_FILE") || { 
+    log_safe "queue_create_fail" "ERROR"
+    return 1
+  }
+  
+  # Case-insensitive URL deduplication
+  declare -A seen_urls_lower
+  
+  for url in "${urls[@]}"; do
+    local url_lower
+    url_lower=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
+    
+    # Skip case-insensitive duplicates
+    if [ -n "${seen_urls_lower[$url_lower]:-}" ]; then
+      log_safe "SKIP duplicate URL (case-insensitive): $url" "INFO"
+      printf '%s\n' "$url" >> "$QUEUE_DIR/duplicate_urls.txt"
+      continue
+    fi
+    seen_urls_lower[$url_lower]=1
+    
+    # FIXED: Use proper URL validation with port support
+    if ! validate_youtube_url "$url"; then
+      pretty_print "$YELLOW" "${WARN} Skipping non-YouTube URL: $url"
+      log_safe "SKIP non-YouTube: $url" "WARN"
+      printf '%s\n' "$url" >> "$QUEUE_DIR/non_youtube_urls.txt"
+      continue
+    fi
+    
+    local weight; weight=$(compute_weight "$url" || echo 0)
+    local dur; dur=$(get_video_duration "$url" || echo 0)
+    local dur_penalty=$(( dur * 100 ))
+    local combined=$(( weight + dur_penalty ))
+    printf '%s|%s\n' "$combined" "$url" >> "$qfile"
+  done
+  sort -t'|' -k1,1n "$qfile" -o "$qfile" 2>>"$LOG_FILE" || true
+  printf '%s' "$qfile"
+}
+# ---------------------------
+# FIXED: Manager with reliable parallelism control
+# ---------------------------
+manage_downloads() {
+  local urls=( "$@" )
+  : > "$QUEUE_DIR/successes.txt"
+  : > "$QUEUE_DIR/failures.txt"
+  : > "$QUEUE_DIR/non_youtube_urls.txt"
+  : > "$QUEUE_DIR/duplicate_urls.txt"
+  : > "$QUEUE_DIR/unreachable_urls.txt"
+  
+  # FIXED: Pass array properly
+  local queue_file; queue_file=$(create_sorted_queue "${urls[@]}") || { 
+    pretty_print "$RED" "${CROSS} Failed to create queue"
+    exit 1
+  }
+  
+  # Load sorted urls
+  mapfile -t sorted_urls < <(cut -d'|' -f2- "$queue_file" | sed '/^\s*$/d')
+  local -a child_pids=()
+  
+  for url in "${sorted_urls[@]}"; do
+    # FIXED: Reliable parallelism control using process counting
+    local running_jobs
+    while true; do
+      running_jobs=0
+      for pid in "${child_pids[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+          ((running_jobs++))
+        fi
+      done
+      (( running_jobs < MAX_PARALLEL )) && break
+      sleep 0.5
+    done
+    
+    # Quick title check; skip unreachable early
+    local t; t=$(get_video_title "$url" 2>/dev/null || true)
+    if [ -z "$t" ]; then
+      pretty_print "$YELLOW" "${WARN} Skipping unreachable/invalid URL: $url"
+      log_safe "SKIP_unreachable $url" "WARN"
+      printf '%s\n' "$url" >> "$QUEUE_DIR/unreachable_urls.txt"
+      continue
+    fi
+    
+    # Start worker in background
+    ( download_worker "$url" ) &
+    # Append PID (no array overwrite)
+    child_pids+=( $! )
+    # Short throttle for system stability
+    sleep 0.1
+  done
+  
+  # Wait for all collected PIDs
+  for pid in "${child_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  
+  # Cleanup queue file
+  rm -f "$queue_file" 2>/dev/null || true
+  
+  # Aggregate counts from files
+  local file_succ=$(wc -l < "$QUEUE_DIR/successes.txt" 2>/dev/null || echo 0)
+  local file_fail=$(wc -l < "$QUEUE_DIR/failures.txt" 2>/dev/null || echo 0)
+  local file_nonyoutube=$(wc -l < "$QUEUE_DIR/non_youtube_urls.txt" 2>/dev/null || echo 0)
+  local file_duplicate=$(wc -l < "$QUEUE_DIR/duplicate_urls.txt" 2>/dev/null || echo 0)
+  local file_unreachable=$(wc -l < "$QUEUE_DIR/unreachable_urls.txt" 2>/dev/null || echo 0)
+  local file_skip=$(( file_nonyoutube + file_duplicate + file_unreachable ))
+  
+  pretty_print "$CYAN" "------------------------------------------"
+  pretty_print "$GREEN" "${CHECK} Successful: $file_succ"
+  pretty_print "$RED" "${CROSS} Failed: $file_fail"
+  pretty_print "$YELLOW" "${WARN} Skipped: $file_skip (non-YouTube: $file_nonyoutube, duplicates: $file_duplicate, unreachable: $file_unreachable)"
+  pretty_print "$CYAN" "📄 Log file   : $LOG_FILE"
+  pretty_print "$CYAN" "📁 Queue dir  : $QUEUE_DIR"
+  log_safe "SUMMARY success=$file_succ fail=$file_fail skip=$file_skip" "SUMMARY"
+  
+  # Proper parsing of success and failure files with field separation
+  if [ -s "$QUEUE_DIR/successes.txt" ]; then
+    pretty_print "$GREEN" "\n${CHECK} Files downloaded:"
+    while IFS='|' read -r name _ _; do
+      # Handle empty or malformed lines
+      if [ -n "$name" ]; then
+        pretty_print "$GREEN" "  - $name"
+      fi
+    done < "$QUEUE_DIR/successes.txt"
+  fi
+  
+  if [ -s "$QUEUE_DIR/failures.txt" ]; then
+    pretty_print "$RED" "\n${CROSS} Failed downloads (reasons):"
+    while IFS='|' read -r t u err; do
+      # Handle empty or malformed lines and ensure title is displayed
+      if [ -n "$t" ]; then
+        pretty_print "$RED" "  - $t"
+        pretty_print "$RED" "      URL: $u"
+        pretty_print "$RED" "      Reason: ${err:-unknown}"
+      elif [ -n "$u" ]; then
+        # Fallback if title is missing but URL exists
+        pretty_print "$RED" "  - [Missing Title] - URL: $u"
+        pretty_print "$RED" "      Reason: ${err:-unknown}"
+      fi
+    done < "$QUEUE_DIR/failures.txt"
+  fi
+  
+  if [ -s "$QUEUE_DIR/non_youtube_urls.txt" ]; then
+    pretty_print "$YELLOW" "\n${WARN} Skipped non-YouTube URLs:"
+    while IFS= read -r u; do 
+      if [ -n "$u" ]; then
+        pretty_print "$YELLOW" "  - $u"
+      fi
+    done < "$QUEUE_DIR/non_youtube_urls.txt"
+  fi
+  
+  if [ -s "$QUEUE_DIR/duplicate_urls.txt" ]; then
+    pretty_print "$YELLOW" "\n${WARN} Skipped duplicate URLs:"
+    while IFS= read -r u; do 
+      if [ -n "$u" ]; then
+        pretty_print "$YELLOW" "  - $u"
+      fi
+    done < "$QUEUE_DIR/duplicate_urls.txt"
+  fi
+  
+  if [ -s "$QUEUE_DIR/unreachable_urls.txt" ]; then
+    pretty_print "$YELLOW" "\n${WARN} Skipped unreachable URLs:"
+    while IFS= read -r u; do 
+      if [ -n "$u" ]; then
+        pretty_print "$YELLOW" "  - $u"
+      fi
+    done < "$QUEUE_DIR/unreachable_urls.txt"
+  fi
+}
+# ---------------------------
+# Entrypoint
+# ---------------------------
+print_header
+if [ $# -lt 1 ]; then
+  pretty_print "$YELLOW" "${INFO} Usage: $0 <youtube_url1> [url2 ...]"
+  pretty_print "$YELLOW" "${INFO} Example: $0 https://youtu.be/abc https://youtu.be/def"
+  exit 1
+fi
+# Run manager with given URLs
+manage_downloads "$@"
